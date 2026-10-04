@@ -2,11 +2,18 @@ import asyncio
 import logging
 import os
 from abc import ABC, abstractmethod
-from typing import AsyncGenerator, List, Optional, Tuple
+from typing import AsyncGenerator, Callable, List, Optional, Tuple, Type
 
 import anthropic
 from anthropic import AsyncAnthropic
-from openai import APIError, APITimeoutError, AsyncOpenAI, RateLimitError
+from openai import (
+    APIConnectionError,
+    APIError,
+    APITimeoutError,
+    AsyncOpenAI,
+    InternalServerError,
+    RateLimitError,
+)
 
 from google import genai
 from google.genai import errors as genai_errors
@@ -17,12 +24,42 @@ from schemas import ChatMessage, ModelConfig, ModelResponse, Role
 logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 3
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
 class BaseLLMClient(ABC):
 
     def __init__(self, config: ModelConfig):
         self.config = config
+
+    async def _retrying_stream(
+        self,
+        open_stream: Callable[[], AsyncGenerator[str, None]],
+        api_errors: Tuple[Type[Exception], ...],
+        is_retryable: Callable[[Exception], bool],
+        provider_name: str,
+    ) -> AsyncGenerator[str, None]:
+        # Solo se reintenta si aún no se emitió ningún fragmento: reintentar después
+        # duplicaría texto ya entregado al consumidor.
+        for attempt in range(MAX_RETRIES):
+            started = False
+            try:
+                async for text in open_stream():
+                    started = True
+                    yield text
+                return
+            except api_errors as exc:
+                can_retry = is_retryable(exc) and not started and attempt < MAX_RETRIES - 1
+                if not can_retry:
+                    logger.error("Error durante el streaming de %s: %s", provider_name, exc)
+                    yield f"[ERROR: {exc}]"
+                    return
+                wait = 2**attempt
+                logger.warning(
+                    "Error transitorio de %s en streaming (%s), reintentando en %ss",
+                    provider_name, type(exc).__name__, wait,
+                )
+                await asyncio.sleep(wait)
 
     @abstractmethod
     async def generate(self, messages: List[ChatMessage]) -> ModelResponse:
@@ -65,9 +102,9 @@ class OpenAIClient(BaseLLMClient):
                     input_tokens=usage.prompt_tokens if usage else None,
                     output_tokens=usage.completion_tokens if usage else None,
                 )
-            except RateLimitError:
+            except (RateLimitError, APIConnectionError, InternalServerError) as exc:
                 wait = 2**attempt
-                logger.warning("Rate limit de OpenAI, reintentando en %ss", wait)
+                logger.warning("Error transitorio de OpenAI (%s), reintentando en %ss", type(exc).__name__, wait)
                 await asyncio.sleep(wait)
             except (APITimeoutError, APIError) as exc:
                 logger.error("Error de API en OpenAI: %s", exc)
@@ -78,26 +115,31 @@ class OpenAIClient(BaseLLMClient):
             content="",
             provider="openai",
             model=self.config.model,
-            error="Límite de reintentos agotado por rate limiting",
+            error="Límite de reintentos agotado por errores transitorios",
         )
 
-    async def stream(self, messages: List[ChatMessage]) -> AsyncGenerator[str, None]:
-        payload = self._to_payload(messages)
-        try:
-            response_stream = await self._client.chat.completions.create(
-                model=self.config.model,
-                messages=payload,
-                temperature=self.config.temperature,
-                max_tokens=self.config.max_tokens,
-                stream=True,
-            )
-            async for chunk in response_stream:
-                delta = chunk.choices[0].delta.content
-                if delta:
-                    yield delta
-        except (APITimeoutError, APIError, RateLimitError) as exc:
-            logger.error("Error durante el streaming de OpenAI: %s", exc)
-            yield f"[ERROR: {exc}]"
+    async def _open_stream(self, messages: List[ChatMessage]) -> AsyncGenerator[str, None]:
+        response_stream = await self._client.chat.completions.create(
+            model=self.config.model,
+            messages=self._to_payload(messages),
+            temperature=self.config.temperature,
+            max_tokens=self.config.max_tokens,
+            stream=True,
+        )
+        async for chunk in response_stream:
+            delta = chunk.choices[0].delta.content
+            if delta:
+                yield delta
+
+    def stream(self, messages: List[ChatMessage]) -> AsyncGenerator[str, None]:
+        return self._retrying_stream(
+            lambda: self._open_stream(messages),
+            api_errors=(APIError,),
+            is_retryable=lambda exc: isinstance(
+                exc, (RateLimitError, APIConnectionError, InternalServerError)
+            ),
+            provider_name="OpenAI",
+        )
 
 
 class AnthropicClient(BaseLLMClient):
@@ -142,9 +184,13 @@ class AnthropicClient(BaseLLMClient):
                     input_tokens=usage.input_tokens if usage else None,
                     output_tokens=usage.output_tokens if usage else None,
                 )
-            except anthropic.RateLimitError:
+            except (
+                anthropic.RateLimitError,
+                anthropic.APIConnectionError,
+                anthropic.InternalServerError,
+            ) as exc:
                 wait = 2**attempt
-                logger.warning("Rate limit de Anthropic, reintentando en %ss", wait)
+                logger.warning("Error transitorio de Anthropic (%s), reintentando en %ss", type(exc).__name__, wait)
                 await asyncio.sleep(wait)
             except anthropic.APIError as exc:
                 logger.error("Error de API en Anthropic: %s", exc)
@@ -155,24 +201,31 @@ class AnthropicClient(BaseLLMClient):
             content="",
             provider="anthropic",
             model=self.config.model,
-            error="Límite de reintentos agotado por rate limiting",
+            error="Límite de reintentos agotado por errores transitorios",
         )
 
-    async def stream(self, messages: List[ChatMessage]) -> AsyncGenerator[str, None]:
+    async def _open_stream(self, messages: List[ChatMessage]) -> AsyncGenerator[str, None]:
         system, payload = self._split_system(messages)
-        try:
-            async with self._client.messages.stream(
-                model=self.config.model,
-                system=system,
-                messages=payload,
-                temperature=self.config.temperature,
-                max_tokens=self.config.max_tokens,
-            ) as stream:
-                async for text in stream.text_stream:
-                    yield text
-        except (anthropic.APIError, anthropic.RateLimitError) as exc:
-            logger.error("Error durante el streaming de Anthropic: %s", exc)
-            yield f"[ERROR: {exc}]"
+        async with self._client.messages.stream(
+            model=self.config.model,
+            system=system,
+            messages=payload,
+            temperature=self.config.temperature,
+            max_tokens=self.config.max_tokens,
+        ) as stream:
+            async for text in stream.text_stream:
+                yield text
+
+    def stream(self, messages: List[ChatMessage]) -> AsyncGenerator[str, None]:
+        return self._retrying_stream(
+            lambda: self._open_stream(messages),
+            api_errors=(anthropic.APIError,),
+            is_retryable=lambda exc: isinstance(
+                exc,
+                (anthropic.RateLimitError, anthropic.APIConnectionError, anthropic.InternalServerError),
+            ),
+            provider_name="Anthropic",
+        )
 
 
 class GeminiClient(BaseLLMClient):
@@ -228,17 +281,12 @@ class GeminiClient(BaseLLMClient):
                     input_tokens=usage.prompt_token_count if usage else None,
                     output_tokens=usage.candidates_token_count if usage else None,
                 )
-            except genai_errors.ClientError as exc:
-                if getattr(exc, "code", None) == 429:
+            except genai_errors.APIError as exc:
+                if getattr(exc, "code", None) in RETRYABLE_STATUS_CODES:
                     wait = 2**attempt
-                    logger.warning("Rate limit de Gemini, reintentando en %ss", wait)
+                    logger.warning("Error transitorio de Gemini (%s), reintentando en %ss", exc.code, wait)
                     await asyncio.sleep(wait)
                     continue
-                logger.error("Error de API en Gemini: %s", exc)
-                return ModelResponse(
-                    content="", provider="gemini", model=self.config.model, error=str(exc)
-                )
-            except genai_errors.APIError as exc:
                 logger.error("Error de API en Gemini: %s", exc)
                 return ModelResponse(
                     content="", provider="gemini", model=self.config.model, error=str(exc)
@@ -247,21 +295,24 @@ class GeminiClient(BaseLLMClient):
             content="",
             provider="gemini",
             model=self.config.model,
-            error="Límite de reintentos agotado por rate limiting",
+            error="Límite de reintentos agotado por errores transitorios",
         )
 
-    async def stream(self, messages: List[ChatMessage]) -> AsyncGenerator[str, None]:
+    async def _open_stream(self, messages: List[ChatMessage]) -> AsyncGenerator[str, None]:
         system, payload = self._split_system(messages)
-        config = self._build_config(system)
-        try:
-            response_stream = await self._client.aio.models.generate_content_stream(
-                model=self.config.model,
-                contents=payload,
-                config=config,
-            )
-            async for chunk in response_stream:
-                if chunk.text:
-                    yield chunk.text
-        except genai_errors.APIError as exc:
-            logger.error("Error durante el streaming de Gemini: %s", exc)
-            yield f"[ERROR: {exc}]"
+        response_stream = await self._client.aio.models.generate_content_stream(
+            model=self.config.model,
+            contents=payload,
+            config=self._build_config(system),
+        )
+        async for chunk in response_stream:
+            if chunk.text:
+                yield chunk.text
+
+    def stream(self, messages: List[ChatMessage]) -> AsyncGenerator[str, None]:
+        return self._retrying_stream(
+            lambda: self._open_stream(messages),
+            api_errors=(genai_errors.APIError,),
+            is_retryable=lambda exc: getattr(exc, "code", None) in RETRYABLE_STATUS_CODES,
+            provider_name="Gemini",
+        )

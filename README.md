@@ -43,7 +43,7 @@ soporte de streaming, validación de esquemas con Pydantic y manejo de errores/r
 | Variable            | Descripción                                               |
 |---------------------|-------------------------------------------------------------|
 | `LLM_PROVIDER`       | `openai`, `anthropic` o `gemini`                              |
-| `LLM_MODEL`          | Nombre del modelo (ej. `gpt-4o-mini`, `claude-3-5-sonnet-20241022`, `gemini-2.5-flash`) |
+| `LLM_MODEL`          | Nombre del modelo (ej. `gpt-4o-mini`, `claude-3-5-sonnet-20241022`, `gemini-3.8-flash`) |
 | `OPENAI_API_KEY`     | Requerida si `LLM_PROVIDER=openai`                            |
 | `ANTHROPIC_API_KEY`  | Requerida si `LLM_PROVIDER=anthropic`                         |
 | `GEMINI_API_KEY`     | Requerida si `LLM_PROVIDER=gemini` (gratuita en Google AI Studio) |

@@ -4,10 +4,13 @@ import os
 
 from dotenv import load_dotenv
 
+from rich.console import Console
+
 from llm_manager import AsyncLLMManager
 from schemas import ChatMessage, ModelConfig, Role
 
 load_dotenv()
+console = Console(markup=False, highlight=False)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(name)s | %(message)s")
 
 QUESTION = "¿Qué es la entropía?"
@@ -15,12 +18,12 @@ QUESTION = "¿Qué es la entropía?"
 DEFAULT_MODELS = {
     "openai": "gpt-4o-mini",
     "anthropic": "claude-3-5-sonnet-20241022",
-    "gemini": "gemini-2.5-flash",
+    "gemini": "gemini-3.8-flash",
 }
 
 
 def build_messages(question: str) -> list[ChatMessage]:
-    # prompt en inglés, comprabado consume menos tokens
+    # TODO: prompt en inglés, comprabado consume menos tokens
     return [
         ChatMessage(role=Role.SYSTEM, content="Sos un asistente técnico. Respondé en 3 líneas como máximo."),
         ChatMessage(role=Role.USER, content=question),
@@ -28,21 +31,24 @@ def build_messages(question: str) -> list[ChatMessage]:
 
 
 async def run_normal(manager: AsyncLLMManager) -> None:
-    print("\n--- Modo normal (ainvoke) ---")
+    console.print("\n--- Modo normal (ainvoke) ---\n", style="cyan")
     response = await manager.generate(build_messages(QUESTION))
     if response.error:
-        print(f"Error controlado: {response.error}")
+        console.print(f"Error controlado: {response.error}", style="red")
         return
-    print(response.content)
-    print(f"(finish_reason={response.finish_reason}, tokens in/out={response.input_tokens}/{response.output_tokens})")
+    console.print(response.content, style="green")
+    console.print(
+        f"(finish_reason={response.finish_reason}, tokens in/out={response.input_tokens}/{response.output_tokens})",
+        style="yellow",
+    )
 
 
 async def run_streaming(manager: AsyncLLMManager) -> None:
-    print("\n--- Modo streaming ---")
+    console.print("\n--- Modo streaming ---", style="cyan")
     async for chunk in manager.stream(build_messages(QUESTION)):
-        print(chunk, end="", flush=True)
+        console.print(chunk, end="", style="green", soft_wrap=True)
     # EOF
-    print()
+    console.print()
 
 
 async def main() -> None:
@@ -50,7 +56,7 @@ async def main() -> None:
     model = os.getenv("LLM_MODEL", DEFAULT_MODELS[provider])
 
     # temperatura cercana a 0 para respuesta técnica y corta
-    config = ModelConfig(provider=provider, model=model, temperature=0.3, max_tokens=300)
+    config = ModelConfig(provider=provider, model=model, temperature=0.3, max_tokens=2048)
     manager = AsyncLLMManager(config)
 
     await run_normal(manager)
